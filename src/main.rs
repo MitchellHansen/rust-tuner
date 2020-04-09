@@ -12,8 +12,8 @@ extern crate ringbuf;
 
 use cpal::traits::{DeviceTrait, EventLoopTrait, HostTrait};
 use ringbuf::RingBuffer;
+use pitch_calc::Hz;
 
-const LATENCY_MS: f32 = 150.0;
 
 // So i need an input stream and no output stream
 // input stream goes into the ringbuffer
@@ -27,9 +27,7 @@ fn main() -> Result<(), anyhow::Error> {
 
     // Default devices.
     let input_device = host.default_input_device().expect("failed to get default input device");
-    let output_device = host.default_output_device().expect("failed to get default output device");
     println!("Using default input device: \"{}\"", input_device.name()?);
-    println!("Using default output device: \"{}\"", output_device.name()?);
 
     // We'll try and use the same format between streams to keep it simple
     let mut format = input_device.default_input_format()?;
@@ -38,26 +36,15 @@ fn main() -> Result<(), anyhow::Error> {
     // Build streams.
     println!("Attempting to build both streams with `{:?}`.", format);
     let input_stream_id = event_loop.build_input_stream(&input_device, &format)?;
-    let output_stream_id = event_loop.build_output_stream(&output_device, &format)?;
     println!("Successfully built streams.");
 
-    // Create a delay in case the input and output devices aren't synced.
-    let latency_frames = (LATENCY_MS / 1_000.0) * format.sample_rate.0 as f32;
-    let latency_samples = latency_frames as usize * format.channels as usize;
+
 
     // The buffer to share samples
-    let ring = RingBuffer::new(latency_samples * 2);
+    let ring = RingBuffer::new(2048 * 16);
     let (mut producer, mut consumer) = ring.split();
 
-    // Fill the samples with 0.0 equal to the length of the delay.
-    for _ in 0..latency_samples {
-        // The ring buffer has twice as much space as necessary to add latency here,
-        // so this should never fail
-        producer.push(0.0).unwrap();
-    }
-
     // Play the streams.
-    println!("Starting the input and output streams with `{}` milliseconds of latency.", LATENCY_MS);
     event_loop.play_stream(input_stream_id.clone())?;
    // event_loop.play_stream(output_stream_id.clone())?;
 
@@ -76,32 +63,15 @@ fn main() -> Result<(), anyhow::Error> {
             match data {
                 cpal::StreamData::Input { buffer: cpal::UnknownTypeInputBuffer::F32(buffer) } => {
                     assert_eq!(id, input_stream_id);
-                    let mut output_fell_behind = false;
                     for &sample in buffer.iter() {
                         if producer.push(sample).is_err() {
-                            output_fell_behind = true;
+                            panic!("overfilled the buffer")
                         }
-                    }
-                    if output_fell_behind {
-                        eprintln!("output stream fell behind: try increasing latency");
                     }
                 },
                 // We don't have an output stream
                 cpal::StreamData::Output { buffer: cpal::UnknownTypeOutputBuffer::F32(mut buffer) } => {
-                    assert_eq!(id, output_stream_id);
-                    let mut input_fell_behind = None;
-                    for sample in buffer.iter_mut() {
-                        *sample = match consumer.pop() {
-                            Ok(s) => s,
-                            Err(err) => {
-                                input_fell_behind = Some(err);
-                                0.0
-                            },
-                        };
-                    }
-                    if let Some(_) = input_fell_behind {
-                        eprintln!("input stream fell behind: try increasing latency");
-                    }
+
                 },
                 _ => panic!("we're expecting f32 data"),
             }
@@ -109,13 +79,25 @@ fn main() -> Result<(), anyhow::Error> {
     });
 
     loop {
+      //  println!("{}", consumer.len());
+        if (consumer.len() > 2048 * 2) {
+            let mut accum = vec![];
+            //accum.push(1.0 as f64);
+            for i in 0..2048 * 2 {
+                match consumer.pop() {
+                    Ok(s) => accum.push((s) as f64),
+                    Err(err) => {
+                        panic!("somehow we overran the ringbuffer");
+                    },
+                }
+            }
+            let (hz, amplitude) = pitch::detect(accum.as_slice());
+            if (hz < 1100.0){
+                println!("{:.2} ==== {:?}",hz, Hz(hz as f32).letter_octave());
+            }
 
+        }
 
 
     }
-    // Run for 3 seconds before closing.
-    println!("Playing for 3 seconds... ");
-    std::thread::sleep(std::time::Duration::from_secs(100000));
-    println!("Done!");
-    Ok(())
 }
